@@ -1,5 +1,5 @@
-<img src="https://zenodo.org/badge/851183465.svg">
 # <img src="https://github.com/user-attachments/assets/548da441-e718-4647-912b-ef3ddd34ba61" width="250"> Parallel Active Learning - automated, modular, and parallel active learning workflow
+<img src="https://zenodo.org/badge/851183465.svg">
 Parallel active learning (PAL) workflow with data and task parallelism through Message Passing Interface (MPI) and mpi4py.
 
 
