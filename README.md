@@ -9,7 +9,12 @@ Parallel active learning (PAL) workflow with data and task parallelism through M
 * PAL is designed in a modular and highly adaptive fashion that can be extended to different tasks with various combinations of resources, data, and ML model types.
 * Implemented with MPI and its Python package (mpi4py), PAL is scalable and can be deployed flexibly on shared- (e.g., laptop) and distributed-memory systems (e.g., computer cluster).
 
-## Prerequisite
+## Installation
+PAL can be installed via pip from the source folder.
+```
+pip install .
+```
+It relies on the following dependencies:
 * Python >= 3.10
 * mpi4py >= 3.1 with openmpi
 * Numpy
@@ -78,7 +83,7 @@ Set the path to the toy example kernels in ``al_setting``:
 ```
 Initialize 64 processes locally
   ```
-  mpirun -n 64 python main.py
+  mpirun -n 64 pal_engine -sf al_setting.py
   ```
 Initialize 64 processes on 2 CPU nodes for 1 hour on a computational cluster with Slurm system
 ```
@@ -96,7 +101,7 @@ export UCX_TLS=dc,self,posix,sysv,cma
 module load mpi/openmpi/4.1
 module load devel/cuda/12.4
 
-mpirun --bind-to core --map-by core --rank-by slot -report-bindings python main.py
+mpirun --bind-to core --map-by core --rank-by slot -report-bindings pal_engine -sf al_setting.py
 ```
 
 ### Run PAL for excited states molecular dynamics (MD) simulations
@@ -144,5 +149,5 @@ module load devel/cuda/12.4
 export OMPI_MCA_coll_hcoll_enable=1
 export UCX_TLS=dc,self,posix,sysv,cma
 
-mpirun --bind-to core --map-by core --rank-by slot -report-bindings python3 main.py
+mpirun --bind-to core --map-by core --rank-by slot -report-bindings pal_engine -sf al_setting.py
 ```
