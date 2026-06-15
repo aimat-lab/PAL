@@ -74,6 +74,7 @@ def engine():
     settings.add_argument("-ngene", "--gene-process", type=int, help="Number of generator processes.")
     settings.add_argument("-nml", "--ml-process", type=int, help="Number of machine learning processes.")
     settings.add_argument("-ot", "--orcl-time", type=float, help="Oracle calculation time in seconds.")
+    settings.add_argument("-opt", "--orcl-penalty-time", type=float, help="Oracle penalty time in seconds if process is busy.")
     settings.add_argument("-psi", "--progress-save-interval", type=float, help="time interval to save the progress.")
     settings.add_argument("-rs", "--retrain-size", type=int, help="Batch size of increment retraining set.")
     settings.add_argument("-gp", "--gpu-pred", type=json.loads, help="GPU index list for predictions.")
@@ -90,6 +91,7 @@ def engine():
             al_settings["dynamic_oracle_list"] = al_settings.pop("dynamic_orcale_list")
             if rank == 0:
                 warnings.warn("This key is deprecated, please use 'dynamic_oracle_list' instead.", DeprecationWarning, 2)
+        al_settings["orcl_penalty_time"] = al_settings.get("orcl_penalty_time", 30)
     for arg in vars(args):
         if arg == "settings_file":
             continue
@@ -107,6 +109,7 @@ def engine():
     n_gene = al_settings["gene_process"]            # number of generator processes
     n_ml = al_settings["ml_process"]                # number of machine learning processes
     orcl_time = al_settings["orcl_time"]            # Oracle calculation time in seconds
+    orcl_penalty_time = al_settings["orcl_penalty_time"] # Penalty time if oracle process is busy
     save_interval = al_settings["progress_save_interval"] # time interval to save the progress
     retrain_size = al_settings["retrain_size"]      # batch size of increment retraining set
     gpu_pred = al_settings["gpu_pred"]                  # gpu index list for predictions
@@ -1002,7 +1005,7 @@ def engine():
                         orcl_to_free.append(i)
                         orcl_free.append(i)
                     else:
-                        orcl_busy[i] += 30
+                        orcl_busy[i] += orcl_penalty_time
             for i in orcl_to_free:
                 orcl_busy.pop(i)
 
@@ -1108,7 +1111,7 @@ def engine():
                         orcl_to_free.append(i)
                         orcl_free.append(i)
                     else:
-                        orcl_busy[i] += 30
+                        orcl_busy[i] += orcl_penalty_time
             for i in orcl_to_free:
                 orcl_busy.pop(i)
         # send stop signal to all Oracle processes

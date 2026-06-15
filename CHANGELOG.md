@@ -5,6 +5,7 @@
 ### Enhancements
 
 * Added command line interface and made code pip-installable (#PR 1 and 2).
+* Added 'orcl_penalty_time' to command line interface to allow the user to set a custom time interval to recheck a busy oracle process (#PR 3).
 
 ### Fixes
 
