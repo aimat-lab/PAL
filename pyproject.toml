@@ -4,12 +4,14 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "PAL"
-version = "3.0.0"
+version = "3.0.0.dev"
 description = "Parallel active learning infrastructure."
 readme = "README.md"
 authors = [{name = "Chen Zhou", email = "chen.zhou@kit.edu"}]
-maintainers = [{name = "Chen Zhou", email = "chen.zhou@kit.edu"}]
-readme = "README.md"
+maintainers = [
+    {name = "Chen Zhou", email = "chen.zhou@kit.edu"},
+    {name = "Holger-Dietrich Saßnick", email = "holger-dietrich.sassnick@umontpellier.fr"},
+]
 license = {file = "LICENSE"}
 requires-python = ">=3.10"
 dependencies = [
@@ -19,7 +21,6 @@ dependencies = [
 
 [project.scripts]
 pal_engine = "pal.cli:engine"
-#TODO add requirements/dependencies.
 
 [tool.setuptools.packages.find]
 include = ["pal*"]
