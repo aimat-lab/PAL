@@ -1,0 +1,26 @@
+[build-system]
+requires = ["setuptools>=64.0.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "PAL"
+version = "3.0.0"
+description = "Parallel active learning infrastructure."
+readme = "README.md"
+authors = [{name = "Chen Zhou", email = "chen.zhou@kit.edu"}]
+maintainers = [{name = "Chen Zhou", email = "chen.zhou@kit.edu"}]
+readme = "README.md"
+license = {file = "LICENSE"}
+requires-python = ">=3.10"
+dependencies = [
+    "numpy>=1.17",
+    "mip4py>=3.1",
+]
+
+[project.scripts]
+pal_engine = "pal.cli:engine"
+#TODO add requirements/dependencies.
+
+[tool.setuptools.packages.find]
+include = ["pal*"]
+namespaces = false

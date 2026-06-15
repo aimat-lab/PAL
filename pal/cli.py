@@ -9,8 +9,11 @@ Created on Tue Jul  4 19:25:28 2023
 import numpy as np
 import importlib.util
 from mpi4py import MPI
-from al_setting import AL_SETTING
 import os, sys, gc, time, pickle, threading
+import json
+from argparse import ArgumentParser
+import warnings
+
 
 RANK_EXCHANGE = 0                                  # rank of exchange process
 RANK_MG = 1                                        # rank of manager process
@@ -47,34 +50,76 @@ def load_module(module_path, module_name):
     spec.loader.exec_module(module)
     return module
 
-if __name__ == "__main__":
-    ##### Active learning workflow set up #####
-    # read setting
-    result_dir = AL_SETTING["result_dir"]          # directory to save all metadata and results
-    ml_buffer_path = AL_SETTING["ml_buffer_path"]  # path to save data ready to send to ML
-    orcl_buffer_path = AL_SETTING["orcl_buffer_path"]    # path to save data ready to send to Oracle
-    n_pred = AL_SETTING["pred_process"]            # number of prediction processes
-    n_orcl = AL_SETTING["orcl_process"]            # number of oracle processes
-    n_gene = AL_SETTING["gene_process"]            # number of generator processes
-    n_ml = AL_SETTING["ml_process"]                # number of machine learning processes
-    orcl_time = AL_SETTING["orcl_time"]            # Oracle calculation time in seconds
-    save_interval = AL_SETTING["progress_save_interval"] # time interval to save the progress
-    retrain_size = AL_SETTING["retrain_size"]      # batch size of increment retraining set
-    gpu_pred = AL_SETTING["gpu_pred"]                  # gpu index list for predictions
-    gpu_ml = AL_SETTING["gpu_ml"]                  # gpu index list for machine learning
-    adjust_orcale = AL_SETTING["dynamic_orcale_list"]  # adjust data points for orcale calculation based on ML predictions everytime when retrainings finish
-    usr_pkg = AL_SETTING["usr_pkg"]                # dictionary of paths to user implemented modules (generator, model, oracle and utils)
-    err_log = os.path.join(result_dir, 'log_error.txt') # Log for error message
-    designate_task_number = AL_SETTING["designate_task_number"] # True if need to specify the number of tasks running on each node (e.g. number of model per computation node)
-    task_per_node = AL_SETTING["task_per_node"]    # designate the number of tasks per node, used only if designate_task_number is True
-    fixed_size_data = AL_SETTING["fixed_size_data"] # set to True if data communicated among kernels have fixed sizes.
-                                                    # if false, additional communications are necessary for each iteration to exchange data size info thus lower efficiency.
-
-    # MPI set up
+def engine():
     comm_world = MPI.COMM_WORLD                    # MPI global communicator
     group_world = comm_world.Get_group()           # MPI group for all processes
     rank = comm_world.Get_rank()                   # rank (PID) of current process
     size = comm_world.Get_size()                   # number of process in total
+
+    ##### Argument Parser #####
+    parser = ArgumentParser(
+        description="Engine to run all PAL kernels in parallel.",
+        add_help=True,
+    )
+    file_paths = parser.add_argument_group("Settings/user files")
+    file_paths.add_argument("-sf", "--settings-file", help="Path to file storing all settings either as json format or Python module.")
+    file_paths.add_argument("-up", "--usr-pkg", type=json.loads, help="Dictionary of paths to user implemented modules (generator, model, oracle and utils)")
+
+    settings = parser.add_argument_group("Settings")
+    settings.add_argument("-rd", "--result-dir", help="Directory to save all metadata and results.")
+    settings.add_argument("-mlbp", "--ml-buffer-path", help="Path to save data ready to send to ML.")
+    settings.add_argument("-obp", "--orcl-buffer-path", help="Path to save data ready to send to Oracle.")
+    settings.add_argument("-npred", "--pred-process", type=int, help="Number of prediction processes.")
+    settings.add_argument("-norcl", "--orcl-process", type=int, help="Number of oracle processes.")
+    settings.add_argument("-ngene", "--gene-process", type=int, help="Number of generator processes.")
+    settings.add_argument("-nml", "--ml-process", type=int, help="Number of machine learning processes.")
+    settings.add_argument("-ot", "--orcl-time", type=float, help="Oracle calculation time in seconds.")
+    settings.add_argument("-psi", "--progress-save-interval", type=float, help="time interval to save the progress.")
+    settings.add_argument("-rs", "--retrain-size", type=int, help="Batch size of increment retraining set.")
+    settings.add_argument("-gp", "--gpu-pred", type=json.loads, help="GPU index list for predictions.")
+    settings.add_argument("-gml", "--gpu-ml", type=json.loads, help="GPU index list for machine learning.")
+    settings.add_argument("-dol", "--dynamic-oracle-list", type=bool, help="Adjust data points for oracle calculation based on ML predictions every time when retrainings finish.")
+    settings.add_argument("-dtn", "--designate-task-number", type=bool, help="True if need to specify the number of tasks running on each node (e.g. number of model per computation node).")
+    settings.add_argument("-tpn", "--task-per-node", type=json.loads, help="Designate the number of tasks per node, used only if designate_task_number is True.")
+    settings.add_argument("-fsd", "--fixed-size-data", type=bool, help="Set to True if data communicated among kernels have fixed sizes. If false, additional communications are necessary for each iteration to exchange data size info thus lower efficiency.")
+    args = parser.parse_args()
+    al_settings = {}
+    if args.settings_file is not None:
+        al_settings = json.load(args.settings_file) if args.settings_file.endswith(".json") else load_module(args.settings_file, "al_settings").AL_SETTING
+        if "dynamic_orcale_list" in al_settings:
+            al_settings["dynamic_oracle_list"] = al_settings.pop("dynamic_orcale_list")
+            if rank == 0:
+                warnings.warn("This key is deprecated, please use 'dynamic_oracle_list' instead.", DeprecationWarning, 2)
+    for arg in vars(args):
+        if arg == "settings_file":
+            continue
+
+        if getattr(args, arg) is not None:
+            al_settings[arg] = getattr(args, arg)
+        assert al_settings.get(arg, None) is not None, f"Setting '{arg}' needs to be set."
+
+    ##### Active learning workflow set up #####
+    result_dir = al_settings["result_dir"]          # directory to save all metadata and results
+    ml_buffer_path = al_settings["ml_buffer_path"]  # path to save data ready to send to ML
+    orcl_buffer_path = al_settings["orcl_buffer_path"]    # path to save data ready to send to Oracle
+    n_pred = al_settings["pred_process"]            # number of prediction processes
+    n_orcl = al_settings["orcl_process"]            # number of oracle processes
+    n_gene = al_settings["gene_process"]            # number of generator processes
+    n_ml = al_settings["ml_process"]                # number of machine learning processes
+    orcl_time = al_settings["orcl_time"]            # Oracle calculation time in seconds
+    save_interval = al_settings["progress_save_interval"] # time interval to save the progress
+    retrain_size = al_settings["retrain_size"]      # batch size of increment retraining set
+    gpu_pred = al_settings["gpu_pred"]                  # gpu index list for predictions
+    gpu_ml = al_settings["gpu_ml"]                  # gpu index list for machine learning
+    adjust_orcale = al_settings["dynamic_oracle_list"]  # adjust data points for oracle calculation based on ML predictions everytime when retrainings finish
+    usr_pkg = al_settings["usr_pkg"]                # dictionary of paths to user implemented modules (generator, model, oracle and utils)
+    err_log = os.path.join(result_dir, 'log_error.txt') # Log for error message
+    designate_task_number = al_settings["designate_task_number"] # True if need to specify the number of tasks running on each node (e.g. number of model per computation node)
+    task_per_node = al_settings["task_per_node"]    # designate the number of tasks per node, used only if designate_task_number is True
+    fixed_size_data = al_settings["fixed_size_data"] # set to True if data communicated among kernels have fixed sizes.
+                                                    # if false, additional communications are necessary for each iteration to exchange data size info thus lower efficiency.
+
+    # MPI set up
     if rank == RANK_MG:
         os.makedirs(result_dir, exist_ok=True)
         if not ml_buffer_path is None and not os.path.exists(ml_buffer_path):
@@ -83,7 +128,7 @@ if __name__ == "__main__":
                     pickle.dump([], fh)
             except:
                 raise Exception("Cannot allocate path to save ML buffer.")
-        
+
         if not orcl_buffer_path is None and not os.path.exists(orcl_buffer_path):
             try:
                 with open(orcl_buffer_path, "wb") as fh:
@@ -96,7 +141,7 @@ if __name__ == "__main__":
         else:
             errout = open(err_log, 'w')
         sys.stderr = errout                        # set up error std output
-        
+
         print(f"Number of processes initialized: {size}")
         assert size >= 2 + n_pred + n_orcl + n_gene + n_ml, f"Number of processes initialized by MPI is {size}, while {2 + n_pred + n_orcl + n_gene + n_ml} processes are needed with 2 for controller\
                                                               {n_pred} for prediction, {n_gene} for generator, {n_orcl} for orcle, and {n_ml} for training. Please check the setting."
@@ -131,7 +176,7 @@ if __name__ == "__main__":
                     processor_info[l[1]].append(l[0])
             # check if the number of processors matches the user assignment
             for kernel, lis in task_per_node.items():
-                if not lis is None: 
+                if not lis is None:
                     assert len(lis) == len(processor_info.keys()), f"{kernel} in task_per_node specify assignment for {len(lis)} \
                                                                      nodes while {len(processor_info.keys())} available. Check the \
                                                                      task_per_node in al_setting."
@@ -200,7 +245,7 @@ if __name__ == "__main__":
             assert len(rank_ml) == n_ml, f"Number of Training processes ({len(rank_ml)}) does not match n_ml ({n_ml}) after assignment. Check the task_per_node setting."
             print("Task distribution on each processor after assignment:")
             print(rank_info)
-    
+
     # set up communicators between different groups of processes
     t_pred_ex = 0                                    # mpi tag for communication between Pred and EXCHANGE process
     t_gene_ex = 1                                  # mpi tag for communication between Gene and EXCHANGE process
@@ -211,7 +256,7 @@ if __name__ == "__main__":
     t_gene = 6                                     # mpi tag for communication among Gene processes
     t_pred = 7                                       # mpi tag for communication among Pred processes
     t_orcl_mg = list(range(8, n_orcl+8))           # mpi tag for communication between Orcl and MG processes
-    
+
     # for generator and exchange process
     group_gene_ex = group_world.Incl([RANK_EXCHANGE,] + rank_gene)
     comm_gene_ex = comm_world.Create_group(group_gene_ex, tag=t_gene_ex)
@@ -227,7 +272,7 @@ if __name__ == "__main__":
     # for MG and machine learning processes
     group_mg_ml = group_world.Incl([RANK_MG,] + rank_ml)
     comm_mg_ml = comm_world.Create_group(group_mg_ml, tag=t_ml_mg)
-    
+
     ##### Generator Process (Gene) #####
     # Propagate trajectories. Send coordinates to PL through EXCHANGE
     if rank in rank_gene:
@@ -236,12 +281,12 @@ if __name__ == "__main__":
         else:
             errout = open(err_log, 'w')
         sys.stderr = errout                        # set up error std output
-        
-        from interface import GeneInterface
+
+        from pal.interface import GeneInterface
         assert "generator" in usr_pkg.keys(), "User defined generator not found in usr_pkg."
         gene_module = load_module(usr_pkg["generator"], "generator")
         gene_worker = GeneInterface(rank, result_dir, gene_module)          # set up interface to user defined generator
-        
+
         stop_run = False
         data_to_gene = None
         comm_data_size = True
@@ -249,8 +294,8 @@ if __name__ == "__main__":
             # generate new data based on prediction from Pred
             # data_to_gene intilized to be None
             stop_run, data_to_pred = gene_worker.generate_new_data(data_to_gene)
-            
-            ########################################## 
+
+            ##########################################
             #    send data to Pred through EXCHANGE    #
             ##########################################
             # communicate the data size info
@@ -273,7 +318,7 @@ if __name__ == "__main__":
             counts = None
             comm_gene_ex.Gatherv([data_sent, MPI.DOUBLE], [data_received, counts, displs, MPI.DOUBLE], root=0)
             ################# Done ##################
-            
+
             #################################################
             #    receive data from Pred through EXCHANGE    #
             #################################################
@@ -301,7 +346,7 @@ if __name__ == "__main__":
             save_progress = True if recvbuf[1] == 1 else False
             data_to_gene = recvbuf[2:]
             ################# Done ##################
-            
+
             if save_progress:
                 # save the current state and data of the generator
                 gene_worker.save_progress(stop_run)
@@ -310,8 +355,8 @@ if __name__ == "__main__":
         gene_worker.stop_run()
 
         print(f"Rank {rank}: Generator process terminated.")
-        
-        
+
+
     ##### prediction Process (Pred) #####
     # Recive input data from Prop through EXCHANGE, make predictions and send back to Prop through EXCHANGE
     # Copy new model/scaler weights from ML process and update models
@@ -321,16 +366,16 @@ if __name__ == "__main__":
         else:
             errout = open(err_log, 'w')
         sys.stderr = errout                        # set up error std output
-        
+
         if len(gpu_pred) == 0:
             gpu_i = -1
         else:
             gpu_i = gpu_pred[rank_pred.index(rank)]
-        from interface import ModelInterface
+        from pal.interface import ModelInterface
         assert "model" in usr_pkg.keys(), "User defined model not found in usr_pkg."
         model_module = load_module(usr_pkg["model"], "model_pred")
         pl_worker = ModelInterface(rank, result_dir, gpu_i, "predict", model_module)
-        
+
         stop_run = False                           # stop signal from generators to shutdown entire active learning workflow
         stop_run_2 = False                         # stop signal from training kernel to shutdown entire active learning workflow
         comm_data_size = True
@@ -350,7 +395,7 @@ if __name__ == "__main__":
                 pl_worker.update(weight_array[1:])
                 del weight_array
                 gc.collect()
-            
+
             #######################################################
             #    receive new inputs from Gene through EXCHANGE    #
             #######################################################
@@ -373,20 +418,20 @@ if __name__ == "__main__":
             stop_run = True if recvbuf[0] == 1 else False
             data_to_pred = np.split(recvbuf, data_section, axis=0)[1:]
             ################# Done ##################
-            
+
             if stop_run:
                 # active learning stoped by generators
                 break
             # stop signal from the training kernel
             stop_run = stop_run_2
-            
+
             # make prediction
             data_to_gene = pl_worker.predict(data_to_pred)
-            
+
             ######################################################
             #    send prediction back to Gene through EXCHANGE   #
             ######################################################
-            # organize the data_to_gene to be collected by Exchange 
+            # organize the data_to_gene to be collected by Exchange
             data_size_send = np.empty((len(data_to_gene),), dtype=int)
             data_send = []
             for i in range(0, len(data_to_gene)):
@@ -418,8 +463,8 @@ if __name__ == "__main__":
         pl_worker.stop_run()
 
         print(f"Rank {rank}: Prediction process terminated.")
-            
-            
+
+
     ##### Machine learning Process (ML) #####
     # Receive inputs and labels from Oracle through MG
     # Retrain the model
@@ -430,16 +475,16 @@ if __name__ == "__main__":
         else:
             errout = open(err_log, 'w')
         sys.stderr = errout                        # set up error std output
-        
+
         if len(gpu_ml) == 0:
             gpu_i = -1
         else:
             gpu_i = gpu_ml[rank_ml.index(rank)]
-        from interface import ModelInterface
+        from pal.interface import ModelInterface
         assert "model" in usr_pkg.keys(), "User defined model not found in usr_pkg."
         model_module = load_module(usr_pkg["model"], "model_train")
         ml_worker = ModelInterface(rank, result_dir, gpu_i, 'train', model_module)
-        
+
         req_weight = None
         stop_run = False
         stop_retrain = False
@@ -493,11 +538,11 @@ if __name__ == "__main__":
             # start non-blocking MPI receive process for new training data
             data_size_recv = np.empty((retrain_size*2+1,), dtype=int)
             new_data_req = comm_mg_ml.Ibcast([data_size_recv, MPI.LONG], root=0)
-            
+
             # start retraining while waiting for new training data
             if not stop_retrain:
                 stop_run_1 = ml_worker.retrain(new_data_req)
-            
+
             # wait for receiving new data points
             # retrainig should stop before or when receiving new data points
             new_data_req.wait()
@@ -509,7 +554,7 @@ if __name__ == "__main__":
 
             if stop_run_2:
                 break
-            
+
             oracl_data_arrive = int(recv_data[1])    # indicate the number of data in the oracle buffer of MG
             data_section = [sum(data_size_recv[:i]) for i in range(1, data_size_recv.shape[0])]
             new_data = np.split(recv_data, data_section, axis=0)[1:]
@@ -518,7 +563,7 @@ if __name__ == "__main__":
             dataset_new = []
             for i in range(0, len(new_data), 2):
                 dataset_new.append([new_data[i], new_data[i+1]])
-            
+
             if adjust_orcale and oracl_data_arrive != -1:
                 # receive data size info
                 data_size_recv = np.empty((oracl_data_arrive,), dtype=int)
@@ -544,7 +589,7 @@ if __name__ == "__main__":
 
             # add new data points to the training set
             ml_worker.add_trainingset(dataset_new)
-            
+
             # save the current progress/data/state of machine learning progress
             ml_worker.save_progress(stop_run=False)
 
@@ -552,14 +597,14 @@ if __name__ == "__main__":
 
             # get model weights
             weight_array = ml_worker.get_weight()
-            
+
             # collect weight array at the first ML process
             if rank == rank_ml[0]:
                 weight_array_collect = np.empty((n_ml*(weight_array.shape[0]+1)), dtype=float)
             else:
                 weight_array_collect = None
             comm_ml.Gather([np.append(np.array([stop_run_1,]).astype(float),weight_array,axis=0), MPI.DOUBLE], [weight_array_collect, MPI.DOUBLE], root=0)
-            
+
             # distribute the weight array to each PL process
             if rank == rank_ml[0]:
                 #stop_run_array = np.zeros(n_ml,)
@@ -574,17 +619,17 @@ if __name__ == "__main__":
 
             # broadcast the stop run signal to all training processes
             stop_retrain = comm_ml.bcast(stop_run_1, root=0)
-                
+
             # free memory
             del weight_array, weight_array_collect
             gc.collect()
-        
+
         # call stop run before terminating
         ml_worker.stop_run()
 
         print(f"Rank {rank}: Training process terminated.")
-            
-            
+
+
     ##### Oracle Process (Orcl) #####
     # Receive inputs from MG and generate ground truth
     if rank in rank_orcl:
@@ -593,12 +638,12 @@ if __name__ == "__main__":
         else:
             errout = open(err_log, 'w')
         sys.stderr = errout                        # set up error std output
-        
-        from interface import OrclInterface
+
+        from pal.interface import OrclInterface
         assert "oracle" in usr_pkg.keys(), "User defined oracle not found in usr_pkg."
         oracle_module = load_module(usr_pkg["oracle"], "oracle")
         orcl_worker = OrclInterface(rank, result_dir, oracle_module)
-        
+
         stop_run = False
         tag_here = t_orcl_mg[rank_orcl.index(rank)]        # MPI tag for this Orcl process
         while not stop_run:
@@ -611,24 +656,24 @@ if __name__ == "__main__":
             comm_world.Recv([data_recv, MPI.DOUBLE], source=RANK_MG, tag=tag_here)
             stop_run = True if data_recv[0] == 1 else False
             input_for_orcl = data_recv[1:]
-            
+
             # check if MG has sent out stop signal
             if stop_run:
                 break
 
             # run orcale calculation for ground truth and stored in orcl_calc_res
             orcl_calc_res = orcl_worker.run_calc(input_for_orcl)
-            
+
             # run orcale calculation for ground truth and stored in orcl_calc_res
             #orcl_calc_res = {}
             #greq = MPI.Grequest.Start(query_fn, free_fn, cancel_fn)
             #orcl_thread = threading.Thread(target=orcl_worker.run_calc, name=f"orcl_{rank}", args=(input_for_orcl, orcl_calc_res, greq), daemon=True)
             #orcl_thread.start()
-            
+
             # wait for orcale to finish calculation
             #while not greq.Test():
             #    time.sleep(1)
-            
+
             ############################################
             # send results of orcale calculation to MG #
             ############################################
@@ -643,8 +688,8 @@ if __name__ == "__main__":
         orcl_worker.stop_run()
 
         print(f"Rank {rank}: Oracle process terminated.")
-            
-    
+
+
     ##### EXCHANGE Process #####
     # Manage MPI communication among PL, Gene and MG processes
     if rank == RANK_EXCHANGE:
@@ -720,7 +765,7 @@ if __name__ == "__main__":
             stop_signal = 1.0 if stop_run else 0.0
             gene_output_gather = np.append([stop_signal,], np.delete(gene_output_gather, gene_output_displs, axis=0), axis=0)
             ################# Done ##################
-            
+
             ####################################
             # Distribute inputs to predictions #
             ####################################
@@ -732,7 +777,7 @@ if __name__ == "__main__":
             # broadcast the generated data to all prediction processes
             comm_pred_ex.Bcast([gene_output_gather, MPI.DOUBLE], root=0)
             ################# Done ##################
-            
+
             if stop_run:
                 size_to_gene = np.array([1,] + [3,] * n_gene, dtype=int)
                 data_to_gene = np.array([-1.0] + [1.0, 1.0, -1.0] * n_gene, dtype=float)
@@ -764,7 +809,7 @@ if __name__ == "__main__":
             # [np.array(n_pred, prediction_1_length), np.array(n_pred, prediction_2_length), ...]
             pred_output_gather = np.split(pred_output_gather[:,1:], data_section, axis=1)
             ################# Done ##################
-            
+
             # organize the inputs of Prediction processes (aka outputs from Generator processes)
             gene_data_section = [np.sum(gene_to_pred_size[1:i]) for i in range(2, gene_to_pred_size.shape[0])]
             gene_output_gather = np.split(gene_output_gather[1:], gene_data_section, axis=0)
@@ -772,7 +817,7 @@ if __name__ == "__main__":
             assert len(pred_output_gather) == n_gene, f"Error at EX: number of elements in pred_output_gather is {len(pred_output_gather)} and not equal to number of Generator processes."
             # Check PL predictions
             input_to_orcl, list_data_to_gene_checked = util_module.prediction_check(gene_output_gather, pred_output_gather)
-            
+
             for d in input_to_orcl:
                 assert(len(d.shape)) == 1, "Error at utils: every element of list_input_to_orcl returned by utils.prediction_check() should be an 1-D numpy array."
             input_to_orcl_buffer += input_to_orcl
@@ -781,7 +826,7 @@ if __name__ == "__main__":
             assert len(list_data_to_gene_checked) == n_gene, f"Error at utils: number of elements in list_data_to_gene_checked from utils.prediction_check() is {len(list_data_to_gene_checked)} and does not match the number of generator processes."
             for d in list_data_to_gene_checked:
                 assert len(d.shape) == 1, "Error at utils: every element of list_data_to_gene_checked returned by utils.prediction_check() should be an 1-D numpy array."
-                
+
             if time.time() - time_start >= save_interval:
                 time_start = time.time()
                 save_progress = True
@@ -789,7 +834,7 @@ if __name__ == "__main__":
                 save_progress = True
             else:
                 save_progress = False
-                
+
             data_to_gene = [-1.0,]    # -1.0 is the place holder for Scatter method
             size_to_gene = [1,]    # 1 is the place holder for Scatter method
             save_signal = 1.0 if save_progress else 0.0
@@ -803,7 +848,7 @@ if __name__ == "__main__":
             if stop_run:
                 print(f"Stop run signal received from training process. Shutdown the workflow...")
                 break
-            
+
             #################################
             # send predictions to Generator #
             #################################
@@ -841,7 +886,7 @@ if __name__ == "__main__":
                 del input_to_orcl_buffer
                 gc.collect()
                 input_to_orcl_buffer = []
-            
+
             # send size info and orcle buffer data to MG
             if (not size_to_mg is None) and (req_list[1] is None or req_list[1].Test()) and (to_mg_thread is None or not to_mg_thread.is_alive()):
                 to_mg_thread = threading.Thread(target=comm_ex_mg, args=(comm_world, RANK_MG, t_ex_mg, size_to_mg.copy(), "int", req_list), daemon=True)
@@ -883,9 +928,9 @@ if __name__ == "__main__":
                 pickle.dump(input_to_orcl_buffer, fh)
 
         print(f"Rank {rank}: Exchange process terminated.")
-    
-    
-    ##### Manager Process #####            
+
+
+    ##### Manager Process #####
     if rank == RANK_MG:
         assert "utils" in usr_pkg.keys(), "User defined utils not found in usr_pkg."
         util_module = load_module(usr_pkg["utils"], "utils")
@@ -899,13 +944,13 @@ if __name__ == "__main__":
                 to_ml_buffer = pickle.load(fh)
         else:
             to_ml_buffer = []                           # buffer for data points to be send to ML
-            
+
         if os.path.exists(orcl_buffer_path):
             with open(orcl_buffer_path, "rb") as fh:
                 to_orcl_buffer = pickle.load(fh)
         else:
             to_orcl_buffer = []                         # buffer for inputs to be send to Oracle
-            
+
         stop_run = False
         save_progress = False
         #req_ml = [None, None, None, None]
@@ -940,7 +985,7 @@ if __name__ == "__main__":
             if stop_run:
                 print(f"Rank {rank}: Message: stop_run signal received from Exchange. Shutting down...")
                 break
-            
+
             # check the busy oracle dict and move process to free list if computation finished
             orcl_to_free = []
             for i, t in orcl_busy.items():
@@ -960,7 +1005,7 @@ if __name__ == "__main__":
                         orcl_busy[i] += 30
             for i in orcl_to_free:
                 orcl_busy.pop(i)
-            
+
             stop_signal = 1.0 if stop_run else 0.0
             ###########################################################
             # send inputs to orcale processes that are currently idle #
@@ -976,7 +1021,7 @@ if __name__ == "__main__":
             orcl_free = orcl_free[s:]
             to_orcl_buffer = to_orcl_buffer[s:]
             ################# Done ##################
-            
+
             #################################################
             # send Oracle labeled data to ML for retraining #
             #################################################
@@ -1029,7 +1074,7 @@ if __name__ == "__main__":
                     # distribute oracle labeled data to each model in ML kernel
                     comm_mg_ml.Bcast([data_to_ml, MPI.DOUBLE], root=0)
             ################# Done ##################
-                        
+
             # save the progress
             if save_progress:
                 if not ml_buffer_path is None:
@@ -1038,13 +1083,13 @@ if __name__ == "__main__":
                 if not orcl_buffer_path is None:
                     with open(orcl_buffer_path, "wb") as fh:
                         pickle.dump(to_orcl_buffer, fh)
-        
+
         # stop all ML processes
         data_to_ml = np.append([1.0, -1.0], [-1.0,]*retrain_size*2, axis=0)
         size_to_ml = np.append([2,], [1,]*retrain_size*2, axis=0)
         req_ml = comm_mg_ml.Ibcast([size_to_ml, MPI.LONG], root=0)
         comm_mg_ml.Bcast([data_to_ml, MPI.DOUBLE], root=0)
-        
+
         # stop all Oracle processes
         while len(orcl_busy) > 0:
             # check the busy oracle dict and move process to free list if computation finished
@@ -1071,7 +1116,7 @@ if __name__ == "__main__":
             tag_here = t_orcl_mg[orcl_free[i] - rank_orcl[0]]
             comm_world.Send([np.array([2,], dtype=int), MPI.LONG], dest=orcl_free[i], tag=tag_here)
             comm_world.Send([np.array([1.0, -1.0], dtype=float), MPI.DOUBLE], dest=orcl_free[i], tag=tag_here)
-            
+
         # save the current progress
         if not ml_buffer_path is None:
             with open(ml_buffer_path, "wb") as fh:
