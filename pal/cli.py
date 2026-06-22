@@ -1101,6 +1101,7 @@ def engine():
                     else:
                         orcl_busy[i] += orcl_penalty_time
                         time.sleep(0.02)
+
             for i in orcl_to_free:
                 orcl_busy.pop(i, None)
 
