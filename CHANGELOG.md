@@ -9,7 +9,8 @@
 
 ### Fixes
 
-* Fixed typo in 'dynamic_orcale_list' keyword (#PR 1)
+* Fixed typo in 'dynamic_orcale_list' keyword (#PR 1).
+* Changed `dtype` to `numpy` types to avoid crashes (#PR 4).
 
 ### Breaking Changes
 
