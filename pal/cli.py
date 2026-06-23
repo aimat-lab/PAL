@@ -14,9 +14,37 @@ import json
 from argparse import ArgumentParser
 import warnings
 
+DINT = np.int64
+DFLOAT = np.float64
 
 RANK_EXCHANGE = 0                                  # rank of exchange process
 RANK_MG = 1                                        # rank of manager process
+errout = None
+
+def assert_no_aliases(buf):
+    ptrs = [a.__array_interface__["data"][0] for a in buf]
+    dup = len(ptrs) - len(set(ptrs))
+    if dup:
+        raise RuntimeError(f"Aliasing detected: {dup} duplicate buffers.")
+
+
+
+def _freeze_and_sig(buf_list):
+    sigs = []
+    for i, a in enumerate(buf_list):
+        a = np.asarray(a, dtype=DFLOAT)
+        # ensure we own our memory and it’s contiguous
+        if a.base is not None:
+            a = a.copy()
+        a = np.ascontiguousarray(a)
+        a.setflags(write=False)   # <-- any later in-place write will raise
+
+        # replace the original entry with the frozen array
+        buf_list[i] = a
+
+        # make a cheap signature so we can compare later
+        sigs.append( (a.size, float(a[:8].sum()), float(a[-8:].sum())) )
+    return sigs
 
 
 def query_fn(status):
@@ -124,6 +152,7 @@ def engine():
 
     # MPI set up
     if rank == RANK_MG:
+        run_timestamp = int(time.time())
         os.makedirs(result_dir, exist_ok=True)
         if not ml_buffer_path is None and not os.path.exists(ml_buffer_path):
             try:
@@ -150,6 +179,9 @@ def engine():
                                                               {n_pred} for prediction, {n_gene} for generator, {n_orcl} for orcle, and {n_ml} for training. Please check the setting."
         assert type(usr_pkg) is dict, '"usr_pkg" in al_setting.py should be a dictionary.'
         assert type(task_per_node) is dict, '"task_per_node" in al_setting.py should be a dictionary.'
+    else:
+        run_timestamp = None
+    run_timestamp = comm_world.bcast(run_timestamp, root=RANK_MG)
     comm_world.Barrier()
 
     # assign task to processes
@@ -250,15 +282,17 @@ def engine():
             print(rank_info)
 
     # set up communicators between different groups of processes
-    t_pred_ex = 0                                    # mpi tag for communication between Pred and EXCHANGE process
-    t_gene_ex = 1                                  # mpi tag for communication between Gene and EXCHANGE process
-    t_ex_mg = 2                                    # mpi tag for communication between EXCHANGE and MG process
-    t_ml_mg = 3                                    # mpi tag for communication between ML and MG process
-    t_ml_pred = 4                                    # mpi tag for communication between ML and Pred process
-    t_ml = 5                                       # mpi tag for communication among ML processes
-    t_gene = 6                                     # mpi tag for communication among Gene processes
-    t_pred = 7                                       # mpi tag for communication among Pred processes
-    t_orcl_mg = list(range(8, n_orcl+8))           # mpi tag for communication between Orcl and MG processes
+    t_pred_ex = 0                           # mpi tag for communication between Pred and EXCHANGE process
+    t_gene_ex = 1                           # mpi tag for communication between Gene and EXCHANGE process
+    t_ex_mg_int = 2                         # mpi tag for communication between EXCHANGE and MG process as integer (e.g. for data size communication)
+    t_ex_mg_float = 3                       # mpi tag for communication between EXCHANGE and MG process as float (e.g. for data communication)
+    t_ml_mg = 4                             # mpi tag for communication between ML and MG process
+    t_ml_pred = 5                           # mpi tag for communication between ML and Pred process
+    t_ml = 6                                # mpi tag for communication among ML processes
+    t_gene = 7                              # mpi tag for communication among Gene processes
+    t_pred = 8                              # mpi tag for communication among Pred processes
+    t_orcl_mg = list(range(9, n_orcl+9))    # mpi tag for communication between Orcl and MG processes
+
 
     # for generator and exchange process
     group_gene_ex = group_world.Incl([RANK_EXCHANGE,] + rank_gene)
@@ -303,19 +337,19 @@ def engine():
             ##########################################
             # communicate the data size info
             if comm_data_size:
-                data_size_send = np.array([data_to_pred.shape[0] + 1,], dtype=int)
+                data_size_send = np.array([data_to_pred.shape[0] + 1,], dtype=DINT)
                 data_size_gather = None
                 # data size info gathered by the controller
                 comm_gene_ex.Gather([data_size_send, MPI.LONG], [data_size_gather, MPI.LONG], root=0)
             else:
                 # valid data size is fixed
-                tmp = np.array([data_to_pred.shape[0] + 1,], dtype=int)
+                tmp = np.array([data_to_pred.shape[0] + 1,], dtype=DINT)
                 assert tmp.shape == data_size_send.shape, "Error at Generator: size is not fixed for data_to_pred returned by UserGene.generate_new_data(). Check your implementation or set fixed_size_data to False in al_setting."
                 assert (tmp == data_size_send).all(), "Error at Generator: size is not fixed for data_to_pred returned by UserGene.generate_new_data(). Check your implementation or set fixed_size_data to False in al_setting."
 
             # send data to EXCHANGE controller kernel
             stop_signal = 1.0 if stop_run else 0.0
-            data_sent = np.append([stop_signal,], data_to_pred, axis=0)
+            data_sent = np.append([stop_signal,], data_to_pred, axis=0).astype(DFLOAT, copy=False)
             data_received = None
             displs = None
             counts = None
@@ -327,7 +361,7 @@ def engine():
             #################################################
             # communicate the data size info
             if comm_data_size:
-                data_size_recv = np.empty((1,), dtype=int)
+                data_size_recv = np.empty((1,), dtype=DINT)
                 data_size_gather = None
 
                 if fixed_size_data:
@@ -339,7 +373,7 @@ def engine():
                 data_size_recv = int(data_size_recv[0])
 
             # receive data from EXCHANGE controller kernel
-            recvbuf = np.empty((data_size_recv,), dtype=float)
+            recvbuf = np.empty((data_size_recv,), dtype=DFLOAT)
             sendbuf = None
             counts = None
             displs = None
@@ -387,7 +421,7 @@ def engine():
             if req_weight is None:
                 # start the communication process with ML to receive new model weights
                 weight_collect = None
-                weight_array = np.empty((pl_worker.get_weight_size()+1,), dtype=float)
+                weight_array = np.empty((pl_worker.get_weight_size()+1,), dtype=DFLOAT)
                 req_weight = comm_ml_pred.Iscatter([weight_collect, MPI.DOUBLE], [weight_array, MPI.DOUBLE], root=0)
             elif req_weight.Test():
                 # new weights received
@@ -403,7 +437,7 @@ def engine():
             #    receive new inputs from Gene through EXCHANGE    #
             #######################################################
             if comm_data_size:
-                data_size_recv = np.empty((n_gene+1,), dtype=int)
+                data_size_recv = np.empty((n_gene+1,), dtype=DINT)
 
                 # data size info scattered by the controller
                 comm_pred_ex.Bcast([data_size_recv, MPI.LONG], root=0)
@@ -411,7 +445,7 @@ def engine():
                 data_section = [sum(data_size_recv[:i]) for i in range(1, data_size_recv.shape[0])]
 
             # receive data from EXCHANGE controller kernel
-            recvbuf = np.empty((np.sum(data_size_recv),), dtype=float)
+            recvbuf = np.empty((np.sum(data_size_recv),), dtype=DFLOAT)
             comm_pred_ex.Bcast([recvbuf, MPI.DOUBLE], root=0)
             #sendbuf = None
             #counts = None
@@ -435,7 +469,7 @@ def engine():
             #    send prediction back to Gene through EXCHANGE   #
             ######################################################
             # organize the data_to_gene to be collected by Exchange
-            data_size_send = np.empty((len(data_to_gene),), dtype=int)
+            data_size_send = np.empty((len(data_to_gene),), dtype=DINT)
             data_send = []
             for i in range(0, len(data_to_gene)):
                 data_size_send[i] = len(data_to_gene[i])
@@ -487,6 +521,7 @@ def engine():
         assert "model" in usr_pkg.keys(), "User defined model not found in usr_pkg."
         model_module = load_module(usr_pkg["model"], "model_train")
         ml_worker = ModelInterface(rank, result_dir, gpu_i, 'train', model_module)
+        # TODO model interface needs to be changed?
 
         req_weight = None
         stop_run = False
@@ -495,11 +530,11 @@ def engine():
         # wait for the new training data before starting retraining #
         #############################################################
         # receive data size info
-        data_size_recv = np.empty((retrain_size*2+1,), dtype=int)
+        data_size_recv = np.empty((retrain_size*2+1,), dtype=DINT)
         new_data_req = comm_mg_ml.Ibcast([data_size_recv, MPI.LONG], root=0)
         new_data_req.wait()
         # receive new data points
-        recv_data = np.empty((np.sum(data_size_recv),), dtype=float)
+        recv_data = np.empty((np.sum(data_size_recv),), dtype=DFLOAT)
         comm_mg_ml.Bcast([recv_data, MPI.DOUBLE], root=0)
         # organize received data
         stop_run = True if recv_data[0] == 1 else False
@@ -515,19 +550,20 @@ def engine():
 
         if not stop_run:
             ml_worker.add_trainingset(dataset_new)
-            if adjust_orcale and oracl_data_arrive != -1:
+            if adjust_orcale and oracl_data_arrive != -1: # and stop_retrain
+                # TODO check stop_retrain condition.
                 # receive data size info
-                data_size_recv = np.empty((oracl_data_arrive,), dtype=int)
+                data_size_recv = np.empty((oracl_data_arrive,), dtype=DINT)
                 comm_mg_ml.Bcast([data_size_recv, MPI.LONG], root=0)
                 # receive oracle data
-                to_orcl_buffer = np.empty((np.sum(data_size_recv),), dtype=float)
+                to_orcl_buffer = np.empty((np.sum(data_size_recv),), dtype=DFLOAT)
                 comm_mg_ml.Bcast([to_orcl_buffer, MPI.DOUBLE], root=0)
                 data_section = [sum(data_size_recv[:i]) for i in range(1, data_size_recv.shape[0])]
                 to_orcl_buffer = np.split(to_orcl_buffer, data_section, axis=0)
                 # make prediction with up-to-date models
                 pred_res = ml_worker.predict(to_orcl_buffer)
                 # send prediction back to MG
-                data_size_send = np.empty((len(pred_res),), dtype=int)
+                data_size_send = np.empty((len(pred_res),), dtype=DINT)
                 data_send = []
                 for i in range(0, len(pred_res)):
                     data_size_send[i] = len(pred_res[i])
@@ -539,7 +575,7 @@ def engine():
                 gc.collect()
         while not stop_run:
             # start non-blocking MPI receive process for new training data
-            data_size_recv = np.empty((retrain_size*2+1,), dtype=int)
+            data_size_recv = np.empty((retrain_size*2+1,), dtype=DINT)
             new_data_req = comm_mg_ml.Ibcast([data_size_recv, MPI.LONG], root=0)
 
             # start retraining while waiting for new training data
@@ -549,7 +585,7 @@ def engine():
             # wait for receiving new data points
             # retrainig should stop before or when receiving new data points
             new_data_req.wait()
-            recv_data = np.empty((np.sum(data_size_recv),), dtype=float)
+            recv_data = np.empty((np.sum(data_size_recv),), dtype=DFLOAT)
             comm_mg_ml.Bcast([recv_data, MPI.DOUBLE], root=0)
 
             # organize received data
@@ -567,19 +603,20 @@ def engine():
             for i in range(0, len(new_data), 2):
                 dataset_new.append([new_data[i], new_data[i+1]])
 
+            # TODO check sto_retrain, stop_run conditions.
             if adjust_orcale and oracl_data_arrive != -1:
                 # receive data size info
-                data_size_recv = np.empty((oracl_data_arrive,), dtype=int)
+                data_size_recv = np.empty((oracl_data_arrive,), dtype=DINT)
                 comm_mg_ml.Bcast([data_size_recv, MPI.LONG], root=0)
                 # receive oracle data
-                to_orcl_buffer = np.empty((np.sum(data_size_recv),), dtype=float)
+                to_orcl_buffer = np.empty((np.sum(data_size_recv),), dtype=DFLOAT)
                 comm_mg_ml.Bcast([to_orcl_buffer, MPI.DOUBLE], root=0)
                 data_section = [sum(data_size_recv[:i]) for i in range(1, data_size_recv.shape[0])]
                 to_orcl_buffer = np.split(to_orcl_buffer, data_section, axis=0)
                 # make prediction with up-to-date models
                 pred_res = ml_worker.predict(to_orcl_buffer)
                 # send prediction back to MG
-                data_size_send = np.empty((len(pred_res),), dtype=int)
+                data_size_send = np.empty((len(pred_res),), dtype=DINT)
                 data_send = []
                 for i in range(0, len(pred_res)):
                     data_size_send[i] = len(pred_res[i])
@@ -603,10 +640,10 @@ def engine():
 
             # collect weight array at the first ML process
             if rank == rank_ml[0]:
-                weight_array_collect = np.empty((n_ml*(weight_array.shape[0]+1)), dtype=float)
+                weight_array_collect = np.empty((n_ml*(weight_array.shape[0]+1)), dtype=DFLOAT)
             else:
                 weight_array_collect = None
-            comm_ml.Gather([np.append(np.array([stop_run_1,]).astype(float),weight_array,axis=0), MPI.DOUBLE], [weight_array_collect, MPI.DOUBLE], root=0)
+            comm_ml.Gather([np.append(np.array([stop_run_1,]).astype(DFLOAT),weight_array,axis=0), MPI.DOUBLE], [weight_array_collect, MPI.DOUBLE], root=0)
 
             # distribute the weight array to each PL process
             if rank == rank_ml[0]:
@@ -615,9 +652,9 @@ def engine():
                     req_weight.Wait()
                 stop_run_array = weight_array_collect.reshape(n_ml, weight_array.shape[0]+1)[:,0]
                 stop_run_1 = (stop_run_array != 0).any()
-                weight_array_collect.reshape(n_ml, weight_array.shape[0]+1)[:,0] = np.array([stop_run_1,]).astype(float)
-                weight_array_collect = np.concatenate((np.append(np.array([stop_run_1,]).astype(float), weight_array, axis=0), weight_array_collect), axis=0)
-                weight_array = np.empty((weight_array.shape[0]+1), dtype=float)
+                weight_array_collect.reshape(n_ml, weight_array.shape[0]+1)[:,0] = np.array([stop_run_1,]).astype(DFLOAT)
+                weight_array_collect = np.concatenate((np.append(np.array([stop_run_1,]).astype(DFLOAT), weight_array, axis=0), weight_array_collect), axis=0)
+                weight_array = np.empty((weight_array.shape[0]+1), dtype=DFLOAT)
                 req_weight = comm_ml_pred.Iscatter([weight_array_collect, MPI.DOUBLE], [weight_array, MPI.DOUBLE], root=0)
 
             # broadcast the stop run signal to all training processes
@@ -651,11 +688,11 @@ def engine():
         tag_here = t_orcl_mg[rank_orcl.index(rank)]        # MPI tag for this Orcl process
         while not stop_run:
             # receive data size from MG
-            data_size_recv = np.empty((1,), dtype=int)
+            data_size_recv = np.empty((1,), dtype=DINT)
             comm_world.Recv([data_size_recv, MPI.LONG], source=RANK_MG, tag=tag_here)
 
             # receive input from MG
-            data_recv = np.empty((int(data_size_recv[0]),), dtype=float)
+            data_recv = np.empty((int(data_size_recv[0]),), dtype=DFLOAT)
             comm_world.Recv([data_recv, MPI.DOUBLE], source=RANK_MG, tag=tag_here)
             stop_run = True if data_recv[0] == 1 else False
             input_for_orcl = data_recv[1:]
@@ -682,7 +719,7 @@ def engine():
             ############################################
             # orcl_calc_res is stored in the list (to_ml_buffer) at MG and is sent to ML for retraining
             # send data size info to MG
-            comm_world.Send([np.array([input_for_orcl.shape[0], orcl_calc_res.shape[0],], dtype=int), MPI.LONG], dest=RANK_MG, tag=tag_here)
+            comm_world.Send([np.array([input_for_orcl.shape[0], orcl_calc_res.shape[0],], dtype=DINT), MPI.LONG], dest=RANK_MG, tag=tag_here)
             # send data to MG
             comm_world.Send([np.append(input_for_orcl, orcl_calc_res, axis=0), MPI.DOUBLE], dest=RANK_MG, tag=tag_here)
             ####################END####################
@@ -735,6 +772,7 @@ def engine():
             input_to_orcl_buffer = []                         # buffer for inputs to be send to Oracle through MG process
 
         stop_run = False
+        # TODO check if to_mg_thread and req_list are needed here?
         to_mg_thread = None
         req_list = [None, None]
         time_start = time.time()
@@ -747,13 +785,13 @@ def engine():
             ###########################################
             # collect data size from each generator process
             if comm_data_size:
-                gene_output_size = np.empty((n_gene+1,), dtype=int)
-                data_size_send = np.array([1,], dtype=int)
+                gene_output_size = np.empty((n_gene+1,), dtype=DINT)
+                data_size_send = np.array([1,], dtype=DINT)
                 comm_gene_ex.Gather([data_size_send, MPI.LONG], [gene_output_size, MPI.LONG], root=0)
-                gene_output_displs = np.array([np.sum(gene_output_size[:i]) for i in range(0, gene_output_size.shape[0])], dtype=int)
+                gene_output_displs = np.array([np.sum(gene_output_size[:i]) for i in range(0, gene_output_size.shape[0])], dtype=DINT)
             # collect data generated by genenrator processes
-            gene_output_gather = np.empty((np.sum(gene_output_size),), dtype=float)
-            data_sent = np.array([-1.0,], dtype=float)
+            gene_output_gather = np.empty((np.sum(gene_output_size),), dtype=DFLOAT)
+            data_sent = np.array([-1.0,], dtype=DFLOAT)
             comm_gene_ex.Gatherv([data_sent, MPI.DOUBLE], [gene_output_gather, gene_output_size, gene_output_displs, MPI.DOUBLE], root=0)
             # shotdown the entire AL workflow if any generator process returns stop_run signal
             stop_run = (gene_output_gather[gene_output_displs[1:]] == 1).any()
@@ -782,9 +820,16 @@ def engine():
             ################# Done ##################
 
             if stop_run:
-                size_to_gene = np.array([1,] + [3,] * n_gene, dtype=int)
-                data_to_gene = np.array([-1.0] + [1.0, 1.0, -1.0] * n_gene, dtype=float)
-                data_to_gene_displs = np.array([np.sum(size_to_gene[:i]) for i in range(0, size_to_gene.shape[0])], dtype=int)
+                size_to_gene = np.array([1,] + [3,] * n_gene, dtype=DINT)
+                data_to_gene = np.array([-1.0] + [1.0, 1.0, -1.0] * n_gene, dtype=DFLOAT)
+                data_to_gene_displs = np.array([np.sum(size_to_gene[:i]) for i in range(0, size_to_gene.shape[0])], dtype=DINT)
+
+                # 1) Distribute a final [stop, save] to every Generator
+                recvsize_tmp = np.empty((1,), dtype=DINT)
+                comm_gene_ex.Scatter([size_to_gene, MPI.LONG], [recvsize_tmp, MPI.LONG], root=0)
+                comm_gene_ex.Scatterv([data_to_gene, size_to_gene, data_to_gene_displs, MPI.DOUBLE],
+                                    [np.empty((recvsize_tmp[0],), dtype=DFLOAT), MPI.DOUBLE], root=0)
+
                 print(f"Stop run signal received from generator process. Shutdown the workflow...")
                 break
             #################################
@@ -792,17 +837,18 @@ def engine():
             #################################
             if comm_data_size:
                 # gather data size info from each Prediction processes
-                tmp = np.zeros((n_gene,), dtype=int)    # place holder for Gather method
-                pred_to_gene_size = np.empty((n_gene*(n_pred+1),), dtype=int)    # receive buffer for size info
+                tmp = np.zeros((n_gene,), dtype=DINT)    # place holder for Gather method
+                pred_to_gene_size = np.empty((n_gene*(n_pred+1),), dtype=DINT)    # receive buffer for size info
                 comm_pred_ex.Gather([tmp, MPI.LONG], [pred_to_gene_size, MPI.LONG], root=0)
                 # organize and validate received size info
                 pred_to_gene_size = pred_to_gene_size[n_gene:].reshape(n_pred, n_gene)    # remove the tmp place holder and reshape the size info
                 assert (pred_to_gene_size[0,:] == pred_to_gene_size[1:,:]).all(), "Error at Prediction: different return value sizes of pl_worker.predict() for different Prediction processes."
                 pred_to_gene_size = pred_to_gene_size[0]
                 data_section = [np.sum(pred_to_gene_size[:i]) for i in range(1, pred_to_gene_size.shape[0])]
+
             # gather predictions from Prediction processes
-            tmp = np.zeros((np.sum(pred_to_gene_size)+1,), dtype=float)    # place holder for Gather method
-            pred_output_gather = np.empty(((np.sum(pred_to_gene_size)+1)*(n_pred+1),), dtype=float)    # receive buffer for predictions
+            tmp = np.zeros((np.sum(pred_to_gene_size)+1,), dtype=DFLOAT)    # place holder for Gather method
+            pred_output_gather = np.empty(((np.sum(pred_to_gene_size)+1)*(n_pred+1),), dtype=DFLOAT)    # receive buffer for predictions
             comm_pred_ex.Gather([tmp, MPI.DOUBLE], [pred_output_gather, MPI.DOUBLE], root=0)
             # organize received predictions
             pred_output_gather = pred_output_gather[np.sum(pred_to_gene_size)+1:].reshape(n_pred, np.sum(pred_to_gene_size)+1)    # remove the tmp place holder and reshape the predictions
@@ -820,10 +866,24 @@ def engine():
             assert len(pred_output_gather) == n_gene, f"Error at EX: number of elements in pred_output_gather is {len(pred_output_gather)} and not equal to number of Generator processes."
             # Check PL predictions
             input_to_orcl, list_data_to_gene_checked = util_module.prediction_check(gene_output_gather, pred_output_gather)
-
+            prev_len = len(input_to_orcl_buffer)
             for d in input_to_orcl:
                 assert(len(d.shape)) == 1, "Error at utils: every element of list_input_to_orcl returned by utils.prediction_check() should be an 1-D numpy array."
-            input_to_orcl_buffer += input_to_orcl
+            input_to_orcl_buffer.extend([np.ascontiguousarray(d.copy())
+                             for d in input_to_orcl])
+
+            assert_no_aliases(input_to_orcl_buffer)
+            sigs_after_predcheck = []
+            for i in range(prev_len, len(input_to_orcl_buffer)):
+                a = input_to_orcl_buffer[i]
+                # if something somehow remained a view, copy again (belt & suspenders)
+                if getattr(a, "base", None) is not None:
+                    a = a.copy()
+                    input_to_orcl_buffer[i] = a
+                a.setflags(write=False)  # any later in-place write will explode here
+
+                # quick signatures (size, head sum, tail sum)
+                sigs_after_predcheck.append( (a.size, DFLOAT(a[:8].sum()), DFLOAT(a[-8:].sum())) )
 
             # check if the number of data in data_to_gene matches the number of generator processes
             assert len(list_data_to_gene_checked) == n_gene, f"Error at utils: number of elements in list_data_to_gene_checked from utils.prediction_check() is {len(list_data_to_gene_checked)} and does not match the number of generator processes."
@@ -845,10 +905,14 @@ def engine():
             for d in list_data_to_gene_checked:
                 data_to_gene = np.concatenate((data_to_gene, [stop_signal, save_signal], d), axis=0)
                 size_to_gene.append(len(d)+2)
-            size_to_gene = np.array(size_to_gene, dtype=int)
-            data_to_gene_displs = np.array([np.sum(size_to_gene[:i]) for i in range(0, size_to_gene.shape[0])], dtype=int)
+            size_to_gene = np.array(size_to_gene, dtype=DINT)
+            data_to_gene_displs = np.array([np.sum(size_to_gene[:i]) for i in range(0, size_to_gene.shape[0])], dtype=DINT)
 
             if stop_run:
+                recvsize_tmp = np.empty((1,), dtype=DINT)
+                comm_gene_ex.Scatter([size_to_gene, MPI.LONG], [recvsize_tmp, MPI.LONG], root=0)
+                comm_gene_ex.Scatterv([data_to_gene, size_to_gene, data_to_gene_displs, MPI.DOUBLE],
+                                    [np.empty((recvsize_tmp[0],), dtype=DFLOAT), MPI.DOUBLE], root=0)
                 print(f"Stop run signal received from training process. Shutdown the workflow...")
                 break
 
@@ -857,7 +921,7 @@ def engine():
             #################################
             # distribute size info to each generator process
             if comm_data_size:
-                recvsize_tmp = np.empty((1,), dtype=int)
+                recvsize_tmp = np.empty((1,), dtype=DINT)
                 comm_gene_ex.Scatter([size_to_gene, MPI.LONG], [recvsize_tmp, MPI.LONG], root=0)
 
                 if fixed_size_data:
@@ -870,7 +934,7 @@ def engine():
                 assert (size_to_gene == size_to_gene_record).all(), "Error at utils: size is not fixed for list_data_to_gene_checked returned by utils.prediction_check(). Check your implementation or set fixed_size_data to False in al_setting."
 
             # distribute predictions to each generator process
-            recvbuf_tmp = np.empty((int(recvsize_tmp[0]),), dtype=float)
+            recvbuf_tmp = np.empty((int(recvsize_tmp[0]),), dtype=DFLOAT)
             comm_gene_ex.Scatterv([data_to_gene, size_to_gene, data_to_gene_displs, MPI.DOUBLE], [recvbuf_tmp, MPI.DOUBLE], root=0)
             ################# Done ##################
 
@@ -884,47 +948,61 @@ def engine():
                 for d in input_to_orcl_buffer:
                     data_to_mg = np.append(data_to_mg, d, axis=0)
                     size_to_mg.append(len(d))
-                size_to_mg = np.array(size_to_mg, dtype=int)
+                size_to_mg = np.array(size_to_mg, dtype=DINT)
                 # free memory
                 del input_to_orcl_buffer
                 gc.collect()
                 input_to_orcl_buffer = []
 
             # send size info and orcle buffer data to MG
-            if (not size_to_mg is None) and (req_list[1] is None or req_list[1].Test()) and (to_mg_thread is None or not to_mg_thread.is_alive()):
-                to_mg_thread = threading.Thread(target=comm_ex_mg, args=(comm_world, RANK_MG, t_ex_mg, size_to_mg.copy(), "int", req_list), daemon=True)
-                to_mg_thread.start()
+            # EXCHANGE → MG: send size, then payload (blocking, back-to-back)
+            if size_to_mg is not None:
+                comm_world.Send(
+                    [np.asarray(size_to_mg, dtype=DINT), MPI.LONG],
+                    dest=RANK_MG,
+                    tag=t_ex_mg_int
+                )
+                if data_to_mg is not None and len(data_to_mg) > 0:
+                    comm_world.Send(
+                        [np.asarray(data_to_mg, dtype=DFLOAT), MPI.DOUBLE],
+                        dest=RANK_MG,
+                        tag=t_ex_mg_float
+                    )
+                # prevent re-sends on next loop
                 size_to_mg = None
-            elif (not data_to_mg is None) and (req_list[0] is None or req_list[0].Test()) and (to_mg_thread is None or not to_mg_thread.is_alive()):
-                to_mg_thread = threading.Thread(target=comm_ex_mg, args=(comm_world, RANK_MG, t_ex_mg, data_to_mg.copy(), "float", req_list), daemon=True)
-                to_mg_thread.start()
                 data_to_mg = None
+
             ################# Done ##################
 
         # send stop_run signal to all Generator processes
         # distribute size info to each generator process
         if comm_data_size:
-            recvsize_tmp = np.empty((1,), dtype=int)
+            recvsize_tmp = np.empty((1,), dtype=DINT)
             comm_gene_ex.Scatter([size_to_gene, MPI.LONG], [recvsize_tmp, MPI.LONG], root=0)
         # distribute predictions to each generator process
-        recvbuf_tmp = np.empty((int(recvsize_tmp[0]),), dtype=float)
+        recvbuf_tmp = np.empty((int(recvsize_tmp[0]),), dtype=DFLOAT)
         comm_gene_ex.Scatterv([data_to_gene, size_to_gene, data_to_gene_displs, MPI.DOUBLE], [recvbuf_tmp, MPI.DOUBLE], root=0)
 
         # send stop_run signal to MG, Oracle and Training processes
-        if not data_to_mg is None:
-            if not req_list[1] is None:
-                req_list[1].wait()
-            if not req_list[0] is None:
-                req_list[0].wait()
-            req = comm_world.Isend([data_to_mg, MPI.DOUBLE], dest=RANK_MG, tag=t_ex_mg)
-            data_to_mg = None
-            req.wait()
-        size_to_mg = np.array([2, 1], dtype=int)
-        data_to_mg = np.array([1.0, 1.0, -1.0], dtype=float)
-        req = comm_world.Isend([size_to_mg, MPI.LONG], dest=RANK_MG, tag=t_ex_mg)
-        req.wait()
-        req = comm_world.Isend([data_to_mg, MPI.DOUBLE], dest=RANK_MG, tag=t_ex_mg)
-        req.wait()
+        # if not data_to_mg is None:
+        #     if not req_list[1] is None:
+        #         req_list[1].wait()
+        #     if not req_list[0] is None:
+        #         req_list[0].wait()
+        #     req = comm_world.Isend([data_to_mg, MPI.DOUBLE], dest=RANK_MG, tag=t_ex_mg)
+        #     data_to_mg = None
+        #     req.wait()
+        # size_to_mg = np.array([2, 1], dtype=int)
+        # data_to_mg = np.array([1.0, 1.0, -1.0], dtype=float)
+        # req = comm_world.Isend([size_to_mg, MPI.LONG], dest=RANK_MG, tag=t_ex_mg)
+        # req.wait()
+        # req = comm_world.Isend([data_to_mg, MPI.DOUBLE], dest=RANK_MG, tag=t_ex_mg)
+        # req.wait()
+        size_to_mg = np.array([2], dtype=DINT)                 # header only
+        data_to_mg = np.array([1.0, 1.0], dtype=DFLOAT)        # [stop, save]
+        comm_world.Send([size_to_mg, MPI.LONG],  dest=RANK_MG, tag=t_ex_mg_int)
+        comm_world.Send([data_to_mg, MPI.DOUBLE], dest=RANK_MG, tag=t_ex_mg_float)
+
         # save the input_to_orcl_buffer before exits
         if len(input_to_orcl_buffer) > 0:
             with open(orcl_buffer_path, "wb") as fh:
@@ -965,27 +1043,43 @@ def engine():
             # Receive input for Oracle from EXCHANGE process #
             ##################################################
             size_status = MPI.Status()
-            if comm_world.Iprobe(source=RANK_EXCHANGE, tag=t_ex_mg, status=size_status):
+            if comm_world.Iprobe(source=RANK_EXCHANGE, tag=t_ex_mg_int, status=size_status):
                 # intialize the receive buffer according to the number of arriving elements
                 n_data = size_status.Get_count(MPI.LONG)
-                ex_size = np.empty((n_data,), dtype=int)
+                ex_size = np.empty((n_data,), dtype=DINT)
                 # receive the size info from EX
-                req_mg = comm_world.Irecv([ex_size, MPI.LONG], source=RANK_EXCHANGE, tag=t_ex_mg)
+                req_mg = comm_world.Irecv([ex_size, MPI.LONG], source=RANK_EXCHANGE, tag=t_ex_mg_int)
                 req_mg.wait()
                 data_section = [np.sum(ex_size[:i]) for i in range(1, n_data)]
                 # receive the data from EX
-                ex_data = np.empty((np.sum(ex_size),), dtype=float)
-                req_mg = comm_world.Irecv([ex_data, MPI.DOUBLE], source=RANK_EXCHANGE, tag=t_ex_mg)
+                ex_data = np.empty((np.sum(ex_size),), dtype=DFLOAT)
+                req_mg = comm_world.Irecv([ex_data, MPI.DOUBLE], source=RANK_EXCHANGE, tag=t_ex_mg_float)
                 req_mg.wait()
                 # organize received data
                 stop_run = True if ex_data[0] == 1.0 else False
                 save_progress = True if ex_data[1] == 1.0 else False
-                input_to_orcl = np.split(ex_data, data_section, axis=0)[1:]
-                to_orcl_buffer += input_to_orcl
+                parts = np.split(ex_data, data_section)[1:]
+                # input_to_orcl = np.split(ex_data, data_section, axis=0)[1:]
+                parts = [np.ascontiguousarray(p, dtype=DFLOAT).copy() for p in parts]
+                for p in parts:
+                    p.setflags(write=False)
+                # to_orcl_buffer += input_to_orcl
+                if stop_run:
+                    # Tell ALL oracle ranks to stop right now (free or busy)
+                    for r in rank_orcl:
+                        idx = rank_orcl.index(r)
+                        tag_here = t_orcl_mg[idx]
+                        # header says: 2 control fields; payload has [1.0, -1.0] (stop)
+                        comm_world.Send([np.array([2], dtype=DINT), MPI.LONG], dest=r, tag=tag_here)
+                        comm_world.Send([np.array([1.0, -1.0], dtype=DFLOAT), MPI.DOUBLE], dest=r, tag=tag_here)
+                    # Exit the MG loop immediately to avoid scheduling any more work
+                    break
+                to_orcl_buffer.extend(parts)
             ################# Done ##################
 
             # stop the iteration if stop_run signal received
             if stop_run:
+                to_orcl_buffer = []
                 print(f"Rank {rank}: Message: stop_run signal received from Exchange. Shutting down...")
                 break
 
@@ -997,17 +1091,19 @@ def engine():
                     tag_here = t_orcl_mg[rank_orcl.index(i)]
                     if comm_world.Iprobe(source=i, tag=tag_here):
                         # receive size info
-                        orcl_size = np.empty((2,), dtype=int)
+                        orcl_size = np.empty((2,), dtype=DINT)
                         comm_world.Recv([orcl_size, MPI.LONG], source=i, tag=tag_here)
-                        orcl_data = np.empty((np.sum(orcl_size),), dtype=float)
+                        orcl_data = np.empty((np.sum(orcl_size),), dtype=DFLOAT)
                         comm_world.Recv([orcl_data, MPI.DOUBLE], source=i, tag=tag_here)
                         to_ml_buffer.append(np.split(orcl_data, [orcl_size[0],], axis=0))
                         orcl_to_free.append(i)
                         orcl_free.append(i)
                     else:
                         orcl_busy[i] += orcl_penalty_time
+                        time.sleep(0.02)
+
             for i in orcl_to_free:
-                orcl_busy.pop(i)
+                orcl_busy.pop(i, None)
 
             stop_signal = 1.0 if stop_run else 0.0
             ###########################################################
@@ -1024,56 +1120,89 @@ def engine():
             orcl_free = orcl_free[s:]
             to_orcl_buffer = to_orcl_buffer[s:]
             ################# Done ##################
+            if comm_world.Iprobe(source=RANK_EXCHANGE, tag=t_ex_mg_int):
+                size_status = MPI.Status()
+                comm_world.Probe(source=RANK_EXCHANGE, tag=t_ex_mg_int, status=size_status)
+                n_data = size_status.Get_count(MPI.LONG)
+                ex_size = np.empty((n_data,), dtype=DINT)
+                comm_world.Recv([ex_size, MPI.LONG],  source=RANK_EXCHANGE, tag=t_ex_mg_int)
+                ex_data = np.empty((np.sum(ex_size),), dtype=DFLOAT)
+                comm_world.Recv([ex_data, MPI.DOUBLE], source=RANK_EXCHANGE, tag=t_ex_mg_float)
+                stop_run = (ex_data[0] == 1.0)
+                save_progress = (ex_data[1] == 1.0)
+                if n_data > 1:
+                    data_section = [np.sum(ex_size[:i]) for i in range(1, n_data)]
+                    parts = np.split(ex_data, data_section)[1:]
+                    parts = [np.ascontiguousarray(p, dtype=DFLOAT).copy() for p in parts]
+                    for p in parts:
+                        p.setflags(write=False)
+                    to_orcl_buffer.extend(parts)
+                if stop_run:
+                    break
 
             #################################################
             # send Oracle labeled data to ML for retraining #
             #################################################
             if len(to_ml_buffer) >= retrain_size:
                 # prepare the message to ML
-                data_to_ml = np.array([stop_signal, len(to_orcl_buffer)], dtype=float)
+                data_to_ml = np.array([stop_signal, len(to_orcl_buffer)], dtype=DFLOAT)
                 size_to_ml = [2,]
                 for i in range(0, retrain_size):
                     data_to_ml = np.concatenate((data_to_ml, to_ml_buffer[i][0], to_ml_buffer[i][1]), axis=0)
                     size_to_ml += [to_ml_buffer[i][0].shape[0], to_ml_buffer[i][1].shape[0]]
-                size_to_ml = np.array(size_to_ml, dtype=int)
+                size_to_ml = np.array(size_to_ml, dtype=DINT)
                 to_ml_buffer = to_ml_buffer[retrain_size:]
                 # distribute new training data and oracle buffer to ML
                 if not stop_run and adjust_orcale and len(to_orcl_buffer) > 1:
                     # distribute size info to ML
                     req_ml = comm_mg_ml.Ibcast([size_to_ml, MPI.LONG], root=0)
+                    req_ml.Wait()
                     # distribute oracle labeled data to each model in ML kernel
                     comm_mg_ml.Bcast([data_to_ml, MPI.DOUBLE], root=0)
                     # organize the oracle buffer
-                    orcl_size = []
-                    orcl_data = []
-                    for d in to_orcl_buffer:
-                        orcl_size.append(d.shape[0])
-                        orcl_data = np.append(orcl_data, d, axis=0)
-                    orcl_size = np.array(orcl_size, dtype=int)
+                    # build sizes as int64 so they match MPI.LONG cleanly
                     # distribute to ML the size info and data of to_orcl_buffer
+                    orcl_size = np.fromiter((int(d.size) for d in to_orcl_buffer), dtype=DINT)
+                    pieces = []
+                    for d in to_orcl_buffer:
+                        c = np.ascontiguousarray(d, dtype=DFLOAT).copy()
+                        c.setflags(write=False)
+                        pieces.append(c)
+                    orcl_data = np.ascontiguousarray(np.concatenate(pieces, axis=0), dtype=DFLOAT)
+                    orcl_data.setflags(write=False)
                     comm_mg_ml.Bcast([orcl_size, MPI.LONG], root=0)
-                    comm_mg_ml.Bcast([orcl_data, MPI.LONG], root=0)
+                    comm_mg_ml.Bcast([orcl_data, MPI.DOUBLE], root=0)
                     # gather prediction from ML
-                    orcl_size = np.empty((len(to_orcl_buffer)*(n_ml+1),), dtype=int)
-                    tmp = np.zeros((len(to_orcl_buffer),), dtype=int)    # placeholder for Gather
+                    orcl_size = np.empty((len(to_orcl_buffer)*(n_ml+1),), dtype=DINT)
+                    tmp = np.zeros((len(to_orcl_buffer),), dtype=DINT)    # placeholder for Gather
                     comm_mg_ml.Gather([tmp, MPI.LONG], [orcl_size, MPI.LONG], root=0)
                     orcl_size = orcl_size[len(to_orcl_buffer):].reshape(n_ml, len(to_orcl_buffer))    # remove placeholder
                     assert (orcl_size[0] == orcl_size[1:]).all(), f"Error at MG: receive different number of predictions from Training processes for oracle buffer."
                     orcl_size = orcl_size[0]
-                    tmp = np.zeros((np.sum(orcl_size),), dtype=float)    # placeholder for Gather
-                    orcl_pred_data = np.empty((np.sum(orcl_size)*(n_ml+1),), dtype=float)
+                    tmp = np.zeros((np.sum(orcl_size),), dtype=DFLOAT)    # placeholder for Gather
+                    orcl_pred_data = np.empty((np.sum(orcl_size)*(n_ml+1),), dtype=DFLOAT)
                     comm_mg_ml.Gather([tmp, MPI.DOUBLE], [orcl_pred_data, MPI.DOUBLE], root=0)
                     # organize gathered data
                     orcl_pred_data = orcl_pred_data[np.sum(orcl_size):].reshape(n_ml, np.sum(orcl_size))    # remove placeholder
                     data_section = [np.sum(orcl_size[:i]) for i in range(1, orcl_size.shape[0])]
                     orcl_pred_data = np.split(orcl_pred_data, data_section, axis=1)
                     assert len(orcl_pred_data) == len(to_orcl_buffer), f"Error at MG: number of predictions ({len(orcl_pred_data)}) differs from number of inputs ({len(to_orcl_buffer)}) for oracle buffer."
-                    to_orcl_buffer = util_module.adjust_input_for_oracle(to_orcl_buffer, orcl_pred_data)
+                    if stop_run:
+                        break
+                    to_orcl_buffer = util_module.adjust_input_for_oracle(to_orcl_buffer, orcl_pred_data, limit=1500)
+                    if stop_run:
+                        break
+
+                    ml_flag_path = os.path.join(result_dir, "ml_updated.flag")
+                    with open(ml_flag_path, "w") as f:
+                        f.write(str(time.time()))
+
                 # distribute only new training data to ML
                 else:
                     data_to_ml[1] = -1
                     # distribute size info to ML
                     req_ml = comm_mg_ml.Ibcast([size_to_ml, MPI.LONG], root=0)
+                    req_ml.wait()
                     # distribute oracle labeled data to each model in ML kernel
                     comm_mg_ml.Bcast([data_to_ml, MPI.DOUBLE], root=0)
             ################# Done ##################
@@ -1103,9 +1232,9 @@ def engine():
                     tag_here = t_orcl_mg[rank_orcl.index(i)]
                     if comm_world.Iprobe(source=i, tag=tag_here):
                         # receive size info
-                        orcl_size = np.empty((2,), dtype=int)
+                        orcl_size = np.empty((2,), dtype=DINT)
                         comm_world.Recv([orcl_size, MPI.LONG], source=i, tag=tag_here)
-                        orcl_data = np.empty((np.sum(orcl_size),), dtype=float)
+                        orcl_data = np.empty((np.sum(orcl_size),), dtype=DFLOAT)
                         comm_world.Recv([orcl_data, MPI.DOUBLE], source=i, tag=tag_here)
                         to_ml_buffer.append(np.split(orcl_data, [orcl_size[0],], axis=0))
                         orcl_to_free.append(i)
@@ -1117,8 +1246,8 @@ def engine():
         # send stop signal to all Oracle processes
         for i in range(0, len(orcl_free)):
             tag_here = t_orcl_mg[orcl_free[i] - rank_orcl[0]]
-            comm_world.Send([np.array([2,], dtype=int), MPI.LONG], dest=orcl_free[i], tag=tag_here)
-            comm_world.Send([np.array([1.0, -1.0], dtype=float), MPI.DOUBLE], dest=orcl_free[i], tag=tag_here)
+            comm_world.Send([np.array([2,], dtype=DINT), MPI.LONG], dest=orcl_free[i], tag=tag_here)
+            comm_world.Send([np.array([1.0, -1.0], dtype=DFLOAT), MPI.DOUBLE], dest=orcl_free[i], tag=tag_here)
 
         # save the current progress
         if not ml_buffer_path is None:
@@ -1133,4 +1262,5 @@ def engine():
     comm_world.Barrier()
     if rank == 0:
         print("All processes exits normally.")
-    errout.close()
+    if errout is not None:
+        errout.close()
