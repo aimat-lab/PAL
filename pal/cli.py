@@ -1262,5 +1262,5 @@ def engine():
     comm_world.Barrier()
     if rank == 0:
         print("All processes exits normally.")
-    if errrout is not None:
+    if errout is not None:
         errout.close()

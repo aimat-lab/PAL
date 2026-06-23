@@ -13,6 +13,9 @@ def test_engine_run(tmpdir):
     shutil.copytree(os.path.dirname(__file__) + "/toy_example", tmpdir, dirs_exist_ok=True)
     subprocess.run(["mpirun", "--np", "8", "--map-by", ":OVERSUBSCRIBE", "pal_engine", "-sf", "al_setting.py"], cwd=tmpdir)
 
+    # Check for errors:
+    assert os.stat(tmpdir + "/results/log_error.txt").st_size == 0
+
     # Check generator history:
     with open(tmpdir + "/results/generator_data_4", "rb") as f_obj:
         gen_history = np.array(pickle.load(f_obj))
