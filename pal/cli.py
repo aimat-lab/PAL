@@ -822,7 +822,7 @@ def engine():
             if stop_run:
                 size_to_gene = np.array([1,] + [3,] * n_gene, dtype=DINT)
                 data_to_gene = np.array([-1.0] + [1.0, 1.0, -1.0] * n_gene, dtype=DFLOAT)
-                data_to_gene_displs = np.array([np.sum(size_to_gene[:i]) for i in range(0, size_to_gene.shape[0])], dtype=DFLOAT)
+                data_to_gene_displs = np.array([np.sum(size_to_gene[:i]) for i in range(0, size_to_gene.shape[0])], dtype=DINT)
 
                 # 1) Distribute a final [stop, save] to every Generator
                 recvsize_tmp = np.empty((1,), dtype=DINT)
@@ -872,7 +872,7 @@ def engine():
             input_to_orcl_buffer.extend([np.ascontiguousarray(d.copy())
                              for d in input_to_orcl])
 
-            _assert_no_aliases(input_to_orcl_buffer)
+            assert_no_aliases(input_to_orcl_buffer)
             sigs_after_predcheck = []
             for i in range(prev_len, len(input_to_orcl_buffer)):
                 a = input_to_orcl_buffer[i]
@@ -1043,7 +1043,7 @@ def engine():
             # Receive input for Oracle from EXCHANGE process #
             ##################################################
             size_status = MPI.Status()
-            if comm_world.Iprobe(source=RANK_EXCHANGE, tag=t_ex_mg, status=size_status):
+            if comm_world.Iprobe(source=RANK_EXCHANGE, tag=t_ex_mg_int, status=size_status):
                 # intialize the receive buffer according to the number of arriving elements
                 n_data = size_status.Get_count(MPI.LONG)
                 ex_size = np.empty((n_data,), dtype=DINT)
